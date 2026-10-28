@@ -157,9 +157,21 @@ ack(#buf{ onwire_count = OnWireCount
 %% @doc 'Negative' ack, put all sent requests back to the head of buffer.
 %% An 'exit' exception is raised if any of the negative-acked requests
 %% reached maximum retry limit.
+%%
+%% A produce response may arrive after its request has already been
+%% re-buffered by a preceding nack_all (e.g. when a broker error storm
+%% fails several in-flight requests at once). Such a late response must
+%% not crash the producer: if the reference is still on-wire, retry the
+%% whole on-wire batch to preserve partition ordering; if it is no longer
+%% on-wire, it is stale and is simply ignored.
 -spec nack(buf(), reference(), any()) -> buf().
 nack(#buf{onwire = [{Ref, _Reqs} | _]} = Buf, Ref, Reason) ->
-  nack_all(Buf, Reason).
+  nack_all(Buf, Reason);
+nack(#buf{onwire = OnWire} = Buf, Ref, Reason) ->
+  case lists:keymember(Ref, 1, OnWire) of
+    true  -> nack_all(Buf, Reason);
+    false -> Buf
+  end.
 
 %% @doc 'Negative' ack, put all sent requests back to the head of buffer.
 %% An 'exit' exception is raised if any of the negative-acked requests

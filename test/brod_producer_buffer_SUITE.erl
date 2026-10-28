@@ -30,6 +30,8 @@
 -export([ t_no_ack/1
         , t_random_latency_ack/1
         , t_nack/1
+        , t_nack_stale_response/1
+        , t_nack_non_head/1
         , t_send_fun_error/1
         ]).
 
@@ -168,6 +170,43 @@ t_send_fun_error(Config) when is_list(Config) ->
   Buf2 = MaybeSend(Buf1),
   ?assertException(exit, {reached_max_retries, "the reason"},
                    MaybeSend(Buf2)).
+
+%% A produce response may arrive after its request has already been
+%% re-buffered by a preceding nack_all. It used to crash with
+%% function_clause because nack/3 only matched the head of onwire.
+t_nack_stale_response(Config) when is_list(Config) ->
+  {Buf0, Send, AddFun} = new_two_req_buffer(),
+  Buf1 = AddFun(AddFun(Buf0, 0), 1),
+  Buf2 = AddFun(AddFun(Buf1, 2), 3),
+  Buf3 = Send(Buf2),
+  Ref1 = receive_produce([0, 1]),
+  Ref2 = receive_produce([2, 3]),
+  Buf4 = brod_producer_buffer:nack(Buf3, Ref1, test), %% re-queue all
+  Buf5 = brod_producer_buffer:nack(Buf4, Ref2, test), %% stale response
+  ?assertEqual(Buf4, Buf5),                           %% ignored, no crash
+  Buf6 = Send(Buf5),                                  %% requests can be resent
+  Ref3 = receive_produce([0, 1]),
+  Ref4 = receive_produce([2, 3]),
+  Buf7 = brod_producer_buffer:ack(Buf6, Ref3),
+  Buf8 = brod_producer_buffer:ack(Buf7, Ref4),
+  ?assert(brod_producer_buffer:is_empty(Buf8)).
+
+%% A negative ack for a non-head request which is still on-wire must
+%% re-queue the whole on-wire batch to preserve ordering, not crash.
+t_nack_non_head(Config) when is_list(Config) ->
+  {Buf0, Send, AddFun} = new_two_req_buffer(),
+  Buf1 = AddFun(AddFun(Buf0, 0), 1),
+  Buf2 = AddFun(AddFun(Buf1, 2), 3),
+  Buf3 = Send(Buf2),
+  _Ref1 = receive_produce([0, 1]),
+  Ref2 = receive_produce([2, 3]),
+  Buf4 = brod_producer_buffer:nack(Buf3, Ref2, test), %% non-head on-wire
+  Buf5 = Send(Buf4),
+  Ref3 = receive_produce([0, 1]),
+  Ref4 = receive_produce([2, 3]),
+  Buf6 = brod_producer_buffer:ack(Buf5, Ref3),
+  Buf7 = brod_producer_buffer:ack(Buf6, Ref4),
+  ?assert(brod_producer_buffer:is_empty(Buf7)).
 
 %%%_* Help functions ===========================================================
 
@@ -383,6 +422,43 @@ make_buf_cb(Ref) ->
       erlang:send(Pid, {?buffered, Ref});
      ({?acked, _BaseOffset}) ->
       erlang:send(Pid, {?acked, Ref})
+  end.
+
+%% Two requests, each carrying two messages, sent on one maybe_send/3 call.
+new_two_req_buffer() ->
+  Self = self(),
+  SendFun =
+    fun(_Conn, Batch, _Vsn) ->
+      Ref = make_ref(),
+      Nums = lists:map(fun(#{key := Bin}) -> binary_to_integer(Bin) end, Batch),
+      Self ! {produce, Ref, Nums},
+      {ok, Ref}
+    end,
+  Buf = brod_producer_buffer:new(_BufferLimit = 2,
+                                 _OnWireLimit = 2,
+                                 _MaxBatchSize = 20, %% 2 messages
+                                 _MaxRetry = 10,
+                                 _MaxLingerTime = 0,
+                                 _MaxLingerCount = 0,
+                                 SendFun),
+  Send = fun(BufIn) ->
+             {ok, BufOut} = brod_producer_buffer:maybe_send(BufIn, Self, 0),
+             BufOut
+         end,
+  Add = fun(BufIn, Num) ->
+            Bin = integer_to_binary(Num),
+            brod_producer_buffer:add(BufIn, make_buf_cb(Num),
+                                     [#{key => Bin, value => Bin}])
+        end,
+  {Buf, Send, Add}.
+
+receive_produce(ExpectedNums) ->
+  receive
+    {produce, Ref, ExpectedNums} -> Ref;
+    {produce, _Ref, Other} ->
+      ct:fail("expected ~p, got ~p", [ExpectedNums, Other])
+  after 1000 ->
+    ct:fail("timed out waiting for ~p", [ExpectedNums])
   end.
 
 %%%_* Emacs ====================================================================
